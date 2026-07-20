@@ -27,7 +27,7 @@ from pathlib import Path
 import pandas as pd
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 
 CONFIG_PATH = Path("/home/efernandez/development/Github/config.ini")
@@ -59,12 +59,8 @@ OUTPUT_COLUMNS = [
     "Rest of the World",
 ]
 
-EA_EXPORT_QUERY = """
-WITH latest_snapshot AS (
-    SELECT MAX(upload_timestamp_utc) AS upload_timestamp_utc
-    FROM at_lng.ea_values
-),
-export_mappings AS (
+EA_EXPORT_QUERY = text("""
+WITH export_mappings AS (
     SELECT
         CAST(dataset_id AS TEXT) AS dataset_id,
         country,
@@ -78,26 +74,39 @@ export_mappings AS (
       AND country IS NOT NULL
       AND country <> ''
 ),
-latest_values AS (
+selected_ids AS (
+    SELECT array_agg(dataset_id ORDER BY dataset_id)::text[] AS dataset_ids
+    FROM export_mappings
+    HAVING count(*) > 0
+),
+run_values AS (
     SELECT
         a.dataset_id,
         a.date::date AS month,
         a.value
-    FROM at_lng.ea_values a
-    JOIN latest_snapshot s
-        ON a.upload_timestamp_utc = s.upload_timestamp_utc
-    WHERE a.dataset_id IN (SELECT dataset_id FROM export_mappings)
+    FROM selected_ids
+    CROSS JOIN LATERAL at_lng.ea_values_at_run(
+        :ea_as_of_run_id, selected_ids.dataset_ids, NULL, NULL
+    ) a
 )
 SELECT
     v.month,
     m.country AS country_name,
     SUM(v.value * 12.0) AS total_mmtpa
-FROM latest_values v
+FROM run_values v
 JOIN export_mappings m
     ON v.dataset_id = m.dataset_id
 GROUP BY v.month, m.country
 ORDER BY v.month, m.country
-"""
+""")
+
+CURRENT_EA_RUN_QUERY = text("""
+    SELECT run_id, snapshot_at
+    FROM at_lng.ea_ingestion_runs
+    WHERE status = 'accepted' AND coverage = 'full'
+    ORDER BY run_id DESC
+    LIMIT 1
+""")
 
 
 def parse_args() -> argparse.Namespace:
@@ -113,6 +122,12 @@ def parse_args() -> argparse.Namespace:
         default=default_output,
         help="Excel output path. Defaults to adhoc_analysis/ea_export_flow_monthly_<timestamp>.xlsx",
     )
+    parser.add_argument(
+        "--ea-as-of-run-id",
+        type=int,
+        default=None,
+        help="Accepted/full EA run ID. Defaults to the captured current run.",
+    )
     return parser.parse_args()
 
 
@@ -122,8 +137,31 @@ def get_engine():
     return create_engine(config["DATABASE"]["CONNECTION_STRING"], pool_pre_ping=True)
 
 
-def fetch_export_data(conn) -> pd.DataFrame:
-    return pd.read_sql_query(EA_EXPORT_QUERY, conn)
+def resolve_ea_run(conn, ea_as_of_run_id: int | None) -> tuple[int, object]:
+    if ea_as_of_run_id is not None:
+        if type(ea_as_of_run_id) is not int or ea_as_of_run_id <= 0:
+            raise ValueError("ea_as_of_run_id must be a positive integer")
+        query = text("""
+            SELECT run_id, snapshot_at
+            FROM at_lng.ea_ingestion_runs
+            WHERE run_id = :run_id
+              AND status = 'accepted'
+              AND coverage = 'full'
+        """)
+        row = conn.execute(query, {"run_id": ea_as_of_run_id}).first()
+    else:
+        row = conn.execute(CURRENT_EA_RUN_QUERY).first()
+    if row is None:
+        raise ValueError("No matching accepted/full Energy Aspects run is available")
+    return int(row.run_id), row.snapshot_at
+
+
+def fetch_export_data(conn, ea_as_of_run_id: int) -> pd.DataFrame:
+    return pd.read_sql_query(
+        EA_EXPORT_QUERY,
+        conn,
+        params={"ea_as_of_run_id": ea_as_of_run_id},
+    )
 
 
 def build_country_matrix(df: pd.DataFrame) -> pd.DataFrame:
@@ -218,8 +256,11 @@ def main() -> None:
 
     try:
         with engine.connect() as conn:
+            ea_as_of_run_id, snapshot_at = resolve_ea_run(
+                conn, args.ea_as_of_run_id
+            )
             print("Fetching Energy Aspects LNG export flow data...")
-            raw_df = fetch_export_data(conn)
+            raw_df = fetch_export_data(conn, ea_as_of_run_id)
     finally:
         engine.dispose()
 
@@ -227,6 +268,7 @@ def main() -> None:
         f"Retrieved {len(raw_df):,} country-month rows from "
         f"{raw_df['month'].min()} to {raw_df['month'].max()}."
     )
+    print(f"EA state: run_id={ea_as_of_run_id} | snapshot_at={snapshot_at}")
 
     print("Building Exports Flow matrix...")
     report_df = build_country_matrix(raw_df)

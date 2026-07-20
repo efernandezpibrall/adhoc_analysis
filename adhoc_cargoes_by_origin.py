@@ -22,7 +22,13 @@ query = """
            ROUND((SUM(cargo_destination_cubic_meters) * 0.0006)::numeric, 2) as volume_mcm,
            CASE WHEN status = 'Delivered' THEN 'Historical' ELSE 'Forecast' END as data_type
     FROM at_lng.kpler_trades
-    WHERE upload_timestamp_utc = (SELECT MAX(upload_timestamp_utc) FROM at_lng.kpler_trades)
+    WHERE upload_timestamp_utc = (
+        SELECT snapshot_timestamp_utc
+        FROM at_lng.kpler_trade_snapshots
+        WHERE run_kind = 'canonical' AND status = 'published'
+        ORDER BY snapshot_date_utc DESC
+        LIMIT 1
+    )
       AND destination_country_name IN ('France', 'United Kingdom', 'Belgium', 'Italy', 'Netherlands', 'Germany')
       AND "end" >= NOW() - INTERVAL '24 months'
       AND "end" <= NOW() + INTERVAL '2 months'
